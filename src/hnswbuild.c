@@ -146,8 +146,8 @@ CreateGraphPages(HnswBuildState * buildstate)
 	HnswElement entryPoint;
 	Buffer		buf;
 	Page		page;
-	HnswElementPtr iter = buildstate->graph->head;
-	char	   *base = buildstate->hnswarea;
+	HnswElementPtr iter = buildstate->graph->head;/* HnswElementPtr is a union of pointer and relative pointer, iter is assigned to the graph vertices' head pointer */
+	char	   *base = buildstate->hnswarea;/* The graph index data's address in memory*/
 
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
@@ -157,11 +157,21 @@ CreateGraphPages(HnswBuildState * buildstate)
 	ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 
 	/* Prepare first page */
+	/*
+	* The following function is doing:
+	* 1. invoke ReadBufferExtended(index, forkNum, P_NEW, RBM_NORMAL, NULL) to extend relation file and get a new block
+	* 2. acquire BUFFER_LOCK_EXCLUSIVE to lock the new buffer
+	* 3. return the new buffer's identifier
+	*/
 	buf = HnswNewBuffer(index, forkNum);
-	page = BufferGetPage(buf);
+	page = BufferGetPage(buf);/* Get the address of the given buffer's identifier */
+	/*
+	* 1. invoke PageInit(page, BufferGetPageSize(buf), sizeof(HnswPageOpaqueData)) to initialize the page's content
+	* 2. initialize nextblkno and page_id in special area
+	*/
 	HnswInitPage(buf, page);
 
-	while (!HnswPtrIsNull(base, iter))
+	while (!HnswPtrIsNull(base, iter))/* The macro return a boolean value, if base is NULL, return (iter.ptr == NULL), else return (iter.relptr == NULL)*/
 	{
 		HnswElement element = HnswPtrAccess(base, iter);
 		Size		etupSize;
@@ -178,6 +188,10 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* Calculate sizes */
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+		/*
+		* We assume the line pointer of element could be successfully allocated, so next we need to confirm that the element, neighbor and neighbor's pointer could fit in
+		* so combinedSize only includes one line pointer of neighbor, it is used to check whether a page has enough space for these two tuples
+		*/
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
 		/* Initial size check */
@@ -186,33 +200,51 @@ CreateGraphPages(HnswBuildState * buildstate)
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("index tuple too large")));
 
+		/* The following function assigns some data of element (in memory) to etup (ready to be written to disk) */
 		HnswSetElementTuple(base, etup, element);
 
-		/* Keep element and neighbors on the same page if possible */
+		/* The following branch guarantees that element and neighbors are kept on the same page */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
+			/* PageGetFreeSpace(page) gets the free space on page, if the remaining space is insufficient to store only element or combination of element and neighbors and itemid*/
+			/*
+			* 1. invoke the same HnswNewBuffer(index, forkNum) as initialization to get a new buffer
+			* 2. page's nextblkno is assigned to the number of new buffer
+			* 3. mark old buffer as dirty and release its lock
+			* 4. acquire new lock to new buffer, let parameter buf refers to new buffer and page points to respective new page
+			* 5. invoke HnswInitPage(*buf, *page) to initialize the new page
+			*/
 			HnswBuildAppendPage(index, &buf, &page, forkNum);
 
 		/* Calculate offsets */
-		element->blkno = BufferGetBlockNumber(buf);
-		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));
+		element->blkno = BufferGetBlockNumber(buf);// record which page element is to be stored 
+		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));// record element's offset on the page, since PageGetMaxOffsetNumber(page) returns current items number
 		if (combinedSize <= maxSize)
 		{
+		/* 
+		* If the total size of element, neighbors and itemid is less than a page's max size for storing items, neighbor is also stored on the same page
+		* Record neighbor data's target page and offset(neighbor is stored next to element)
+		*/
 			element->neighborPage = element->blkno;
 			element->neighborOffno = OffsetNumberNext(element->offno);
 		}
 		else
 		{
+		/* 
+		* If not, neighbor is stored on the next new page(so the potential space of previous page is wasted)
+		* Record neighbor data's target page and offset(neighbor is the item on the new page)
+		*/
 			element->neighborPage = element->blkno + 1;
 			element->neighborOffno = FirstOffsetNumber;
 		}
 
+		/* Store neighbor page number and offset to neighbortid*/
 		ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
 
 		/* Add element */
 		if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
-		/* Add new page if needed */
+		/* Add new page if remaining space is not enough to store neighbors */
 		if (PageGetFreeSpace(page) < ntupSize)
 			HnswBuildAppendPage(index, &buf, &page, forkNum);
 
@@ -221,6 +253,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 	}
 
+	// Get the last index page number and write it on the meta page
 	insertPage = BufferGetBlockNumber(buf);
 
 	/* Commit */
@@ -1066,7 +1099,7 @@ BuildGraph(HnswBuildState * buildstate, ForkNumber forkNum)
 
 	/* Attempt to launch parallel worker scan when required */
 	if (parallel_workers > 0)
-		HnswBeginParallel(buildstate, buildstate->indexInfo->ii_Concurrent, parallel_workers);
+		HnswBeginParallel(buildstate, buildstate->indexInfo->ii_Concurrent, parallel_workers);/*parallel index build*/
 
 	/* Add tuples to graph */
 	if (buildstate->heap != NULL)
@@ -1075,7 +1108,7 @@ BuildGraph(HnswBuildState * buildstate, ForkNumber forkNum)
 			buildstate->reltuples = ParallelHeapScan(buildstate);
 		else
 			buildstate->reltuples = table_index_build_scan(buildstate->heap, buildstate->index, buildstate->indexInfo,
-														   true, true, BuildCallback, (void *) buildstate, NULL);
+														   true, true, BuildCallback, (void *) buildstate, NULL);/*serial index build*/
 
 		buildstate->indtuples = buildstate->graph->indtuples;
 	}
