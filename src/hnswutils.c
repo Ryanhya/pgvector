@@ -455,11 +455,12 @@ HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
 
 	for (int lc = e->level; lc >= 0; lc--)
 	{
-		HnswNeighborArray *neighbors = HnswGetNeighbors(base, e, lc);
+		HnswNeighborArray *neighbors = HnswGetNeighbors(base, e, lc); /* Get e's neighbors at layer lc*/
 		int			lm = HnswGetLayerM(m, lc);
 
 		for (int i = 0; i < lm; i++)
 		{
+			/* ItemPointer is a pointer of ItemPointerData and ntup->indextids[idx++] is a ItemPointerData object whose index is idx */
 			ItemPointer indextid = &ntup->indextids[idx++];
 
 			if (i < neighbors->length)

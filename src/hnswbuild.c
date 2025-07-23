@@ -53,6 +53,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
+#include <pthread.h>
 
 #if PG_VERSION_NUM >= 140000
 #include "utils/backend_progress.h"
@@ -69,6 +70,7 @@
 #define PARALLEL_KEY_HNSW_AREA			UINT64CONST(0xA000000000000002)
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000003)
 
+#define MAX_PARALLEL_GROUPS 8
 /*
  * Create the metapage
  */
@@ -203,7 +205,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		/* The following function assigns some data of element (in memory) to etup (ready to be written to disk) */
 		HnswSetElementTuple(base, etup, element);
 
-		/* The following branch guarantees that element and neighbors are kept on the same page */
+		/* The following branch guarantees that element and neighbors are kept on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
 			/* PageGetFreeSpace(page) gets the free space on page, if the remaining space is insufficient to store only element or combination of element and neighbors and itemid*/
 			/*
@@ -215,7 +217,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 			*/
 			HnswBuildAppendPage(index, &buf, &page, forkNum);
 
-		/* Calculate offsets */
+		/* Calculate offsets so that WriteNeighborTuples can assign neighbor tuples depend on this*/
 		element->blkno = BufferGetBlockNumber(buf);// record which page element is to be stored 
 		element->offno = OffsetNumberNext(PageGetMaxOffsetNumber(page));// record element's offset on the page, since PageGetMaxOffsetNumber(page) returns current items number
 		if (combinedSize <= maxSize)
@@ -265,6 +267,165 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 	pfree(etup);
 	pfree(ntup);
+}
+
+
+static BlockGroupList *
+PrecomputeElementPositions(HnswBuildState *buildstate)
+{
+    HnswElementPtr iter = buildstate->graph->head;
+    char *base = buildstate->hnswarea;
+    Size maxSize = HNSW_MAX_SIZE;
+    BlockNumber currentBlock = 0;
+    Size availableSpace = maxSize;
+    OffsetNumber currentOffset = FirstOffsetNumber;
+    BlockGroupList *groupList = palloc0(sizeof(BlockGroupList));
+    BlockGroup *currentGroup = NULL;
+
+    groupList->groups = NIL;
+
+    while (!HnswPtrIsNull(base, iter)) {
+        HnswElement element = HnswPtrAccess(base, iter);
+        Pointer valuePtr = HnswPtrAccess(base, element->value);
+        Size etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+        Size ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+        Size combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
+
+		if (etupSize > HNSW_TUPLE_ALLOC_SIZE)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("index tuple too large")));
+
+        // 判断是否需要新建 block
+        if (!currentGroup || availableSpace < etupSize || (combinedSize <= maxSize && availableSpace < combinedSize)) {
+            currentBlock++;
+            currentOffset = FirstOffsetNumber;
+            availableSpace = maxSize;
+            currentGroup = palloc0(sizeof(BlockGroup));
+			currentGroup->isSeperated = false;
+			currentGroup->logicBlkno = currentBlock;
+            currentGroup->elements = NIL;
+            groupList->groups = lappend(groupList->groups, currentGroup);
+        }
+
+        // 记录 etup/ntup 的 block/offset
+        element->blkno = currentBlock;
+        element->offno = currentOffset;
+        if (combinedSize <= maxSize) {
+            element->neighborPage = currentBlock;
+            element->neighborOffno = currentOffset + 1;
+            currentOffset += 2;
+            availableSpace -= (etupSize + ntupSize + 2 * sizeof(ItemIdData));
+			currentGroup->elements = lappend(currentGroup->elements, element);
+        } else {
+            element->neighborPage = currentBlock + 1;
+            element->neighborOffno = FirstOffsetNumber;
+			currentGroup->elements = lappend(currentGroup->elements, element);
+
+			// 下一个 block 会处理 neighbor
+			currentBlock++;
+			currentOffset = FirstOffsetNumber + 1;
+			availableSpace = maxSize - ntupSize;
+			currentGroup = palloc0(sizeof(BlockGroup));
+			currentGroup->isSeperated = true;
+			currentGroup->logicBlkno = currentBlock;
+			currentGroup->elements = NIL;
+			groupList->groups = lappend(groupList->groups, currentGroup);
+        }
+        
+
+        iter = element->next;
+    }
+    return groupList;
+}
+
+
+static void *
+WriteBlockGroup(void *arg)
+{
+    WriteGroupArg *warg = (WriteGroupArg *)arg;
+    BlockGroup *group = warg->group;
+    HnswBuildState *buildstate = warg->buildstate;
+
+    Relation index = buildstate->index;
+    ForkNumber forkNum = buildstate->forkNum;
+    HnswElementTuple etup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+    HnswNeighborTuple ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
+
+    Buffer  buf = HnswNewBuffer(index, forkNum);//这里一次性只分配一张页面，由于group数已确定，其实可以一次性分配多张页面？
+	Page page = BufferGetPage(buf);
+	HnswInitPage(buf, page);
+	group->physicalBlkno = BufferGetBlockNumber(buf);
+	
+
+    ListCell *lc;
+	if(group->isSeperated){
+		lc = list_tail(warg->preGroup->elements);
+		if (warg->preGroup && lc) {
+			HnswElement preElement = (HnswElement) lfirst(lc);
+			Size ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(preElement->level, buildstate->m);
+			MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
+			HnswSetNeighborTuple(buildstate->hnswarea, ntup, preElement, buildstate->m);
+			if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != preElement->neighborOffno)
+				elog(ERROR, "failed to add neighbor item to \"%s\"", RelationGetRelationName(index));
+		}
+	}
+
+    foreach(lc, group->elements) {
+        HnswElement element = (HnswElement) lfirst(lc);
+        Pointer valuePtr = HnswPtrAccess(buildstate->hnswarea, element->value);
+        Size etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+        Size ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
+
+        MemSet(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
+        HnswSetElementTuple(buildstate->hnswarea, etup, element);	
+        ItemPointerSet(&etup->neighbortid, element->neighborPage, element->neighborOffno);
+
+        if (PageAddItem(page, (Item) etup, etupSize, InvalidOffsetNumber, false, false) != element->offno)
+            elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+		
+		if (element->blkno == element->neighborPage){
+			MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
+			HnswSetNeighborTuple(buildstate->hnswarea, ntup, element, buildstate->m);
+			if (PageAddItem(page, (Item) ntup, ntupSize, InvalidOffsetNumber, false, false) != element->neighborOffno)
+				elog(ERROR, "failed to add neighbor item to \"%s\"", RelationGetRelationName(index));
+		}
+    }
+
+	HnswPageGetOpaque(*page)->nextblkno = group->logicBlkno + 1;
+
+	MarkBufferDirty(buf);
+    UnlockReleaseBuffer(buf);
+    pfree(etup);
+    pfree(ntup);
+    return NULL;
+}
+
+static void
+WriteGraphPagesParallel(HnswBuildState *buildstate)
+{
+    BlockGroupList *groupList = PrecomputeElementPositions(buildstate);
+    int ngroups = list_length(groupList->groups);
+    int max_threads = MAX_PARALLEL_GROUPS;
+    pthread_t threads[MAX_PARALLEL_GROUPS];
+    WriteGroupArg args[MAX_PARALLEL_GROUPS];
+
+    int group_idx = 0;
+    while (group_idx < ngroups) {
+        int batch = Min(max_threads, ngroups - group_idx);
+        for (int i = 0; i < batch; i++) {
+            BlockGroup *group = (BlockGroup *)list_nth(groupList->groups, group_idx + i);
+            args[i].group = group;
+			args[i].preGroup = (group_idx == 0) ? NULL : (BlockGroup *)list_nth(groupList->groups, group_idx + i - 1);
+            args[i].buildstate = buildstate;
+            pthread_create(&threads[i], NULL, WriteBlockGroup, &args[i]);
+        }
+        for (int i = 0; i < batch; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        group_idx += batch;
+    }
+    // 后续写 meta page 等
 }
 
 /*

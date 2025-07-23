@@ -135,6 +135,23 @@ HnswPtrDeclare(HnswNeighborArray, HnswNeighborArrayRelptr, HnswNeighborArrayPtr)
 HnswPtrDeclare(HnswNeighborArrayPtr, HnswNeighborsRelptr, HnswNeighborsPtr);
 HnswPtrDeclare(char, DatumRelptr, DatumPtr);
 
+typedef struct {
+	bool isSeperated;// 当前页面第一个元组是否为上一页面顶点元素的邻居
+	BlockNumber logicBlkno;
+	BlockNumber physicalBlkno;
+    List *elements; // 存储属于同一块的 HnswElement 指针
+} BlockGroup;
+
+typedef struct {
+    List *groups; // 所有 BlockGroup
+} BlockGroupList;
+
+typedef struct {
+    BlockGroup *group;
+	BlockGroup *preGroup;
+    HnswBuildState *buildstate;
+} WriteGroupArg;
+
 struct HnswElementData
 {
 	HnswElementPtr next;
