@@ -492,8 +492,10 @@ With relaxed ordering, you can use a [materialized CTE](https://www.postgresql.o
 ```sql
 WITH relaxed_results AS MATERIALIZED (
     SELECT id, embedding <-> '[1,2,3]' AS distance FROM items WHERE category_id = 123 ORDER BY distance LIMIT 5
-) SELECT * FROM relaxed_results ORDER BY distance;
+) SELECT * FROM relaxed_results ORDER BY distance + 0;
 ```
+
+Note: `+ 0` is needed for Postgres 17+
 
 For queries that filter by distance, use a materialized CTE and place the distance filter outside of it for best performance (due to the [current behavior](https://www.postgresql.org/message-id/flat/CAOdR5yGUoMQ6j7M5hNUXrySzaqZVGf_Ne%2B8fwZMRKTFxU1nbJg%40mail.gmail.com) of the Postgres executor)
 
@@ -783,7 +785,7 @@ Go | [pgvector-go](https://github.com/pgvector/pgvector-go)
 Haskell | [pgvector-haskell](https://github.com/pgvector/pgvector-haskell)
 Java, Kotlin, Groovy, Scala | [pgvector-java](https://github.com/pgvector/pgvector-java)
 JavaScript, TypeScript | [pgvector-node](https://github.com/pgvector/pgvector-node)
-Julia | [pgvector-julia](https://github.com/pgvector/pgvector-julia)
+Julia | [Pgvector.jl](https://github.com/pgvector/Pgvector.jl)
 Lisp | [pgvector-lisp](https://github.com/pgvector/pgvector-lisp)
 Lua | [pgvector-lua](https://github.com/pgvector/pgvector-lua)
 Nim | [pgvector-nim](https://github.com/pgvector/pgvector-nim)
